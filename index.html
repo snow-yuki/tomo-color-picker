@@ -324,18 +324,22 @@
             // 十字线
             if (drawCrossMarker) {
                 gctx.strokeStyle = "rgba(0,0,0,0.8)";
-                gctx.lineWidth = 1;
-                gctx.beginPath();
-                gctx.moveTo(rx, 0); gctx.lineTo(rx, guideOverlay.height);
-                gctx.moveTo(0, ry); gctx.lineTo(guideOverlay.width, ry);
-                gctx.stroke();
+            } else {
+                gctx.strokeStyle = "rgba(255,255,255,0.8)";
             }
+            gctx.lineWidth = 1;
+            gctx.beginPath();
+            gctx.moveTo(rx, 0); gctx.lineTo(rx, guideOverlay.height); 
+            if (drawCrossMarker) {
+                gctx.moveTo(0, ry); gctx.lineTo(guideOverlay.width, ry);
+            }
+            gctx.stroke();
 
             // 小圆圈
             gctx.strokeStyle = (rgb[0]+rgb[1]+rgb[2] > 400) ? "black" : "white"; // 根据底色反转圆圈颜色
-            gctx.lineWidth = 3;
+            gctx.lineWidth = Math.max(4*sw, 1);
             gctx.beginPath();
-            gctx.arc(rx, ry, 8, 0, Math.PI * 2);
+            gctx.arc(rx, ry, Math.max(10*sw, 2), 0, Math.PI * 2);
             gctx.stroke();
         };
 
@@ -358,9 +362,9 @@
 
             // gctx.strokeStyle = (rgb[0]+rgb[1]+rgb[2] > 400) ? "black" : "white";
             gctx.strokeStyle = "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ",1)";
-            gctx.lineWidth = 8;
+            gctx.lineWidth = Math.max(10*sw, 1);
             gctx.beginPath();
-            gctx.arc(rx, ry, 49, 0, Math.PI * 2);
+            gctx.arc(rx, ry, Math.max(62*sw, 1), 0, Math.PI * 2);
             gctx.stroke();
         }
 
