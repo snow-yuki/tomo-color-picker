@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tomo Color Picker</title>
+    <style>
+        :root {
+            --bg-color: #f0f0f0;
+            --panel-bg: #ffffff;
+            --accent-color: #ff8100;
+        }
+
+        body, html {
+            margin: 0; padding: 0; height: 100%; width: 100%;
+            font-family: sans-serif; background: var(--bg-color);
+            overflow: hidden;
+        }
+
+        /* 布局 */
+        .container {
+            display: flex; flex-direction: row;
+            height: calc(100% - 50px); width: 100%;
+        }
+
+        header {
+            height: 50px; background: #333; color: white;
+            display: flex; align-items: center; padding: 0 15px;
+            gap: 10px; z-index: 100;
+        }
+
+        .pane {
+            flex: 1; position: relative; overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
+            border: 1px solid #ccc; background: #ddd;
+        }
+
+        /* 工具栏按钮 */
+        button {
+            padding: 8px 15px; cursor: pointer;
+            background: var(--accent-color); border: none;
+            color: white; border-radius: 4px; font-weight: bold;
+        }
+        button:hover { opacity: 0.9; }
+
+        /* 取色区域 */
+        #source-canvas {
+            image-rendering: pixelated; /* 像素级放大 */
+            cursor: crosshair;
+        }
+
+        /* 参考区域 */
+        #guide-wrapper {
+            position: relative; line-height: 0;
+            max-width: 100%; max-height: 100%;
+        }
+        #guide-img {
+            max-width: 100%; height: auto; display: block;
+        }
+        #guide-overlay {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%; pointer-events: none;
+        }
+
+        /* 颜色预览 */
+        #color-info {
+            margin-left: auto; display: flex; align-items: center; gap: 10px;
+        }
+        .preview-box {
+            width: 30px; height: 30px; border: 2px solid white; border-radius: 50%;
+        }
+
+        /* 手机端适配 */
+        @media (max-width: 768px) {
+            .container { flex-direction: column; }
+            header { font-size: 14px; padding: 5px; height: auto; flex-wrap: wrap; }
+            .preview-box { width: 20px; height: 20px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <button onclick="document.getElementById('file-input').click()">Change Image</button>
+    <button onclick="resetView()">Reset Position</button>
+    <input type="file" id="file-input" hidden accept="image/*" onchange="handleFile(event)">
+    
+    <div id="color-info">
+        <div id="current-color-bg" class="preview-box" style="background: transparent;"></div>
+        <span id="rgb-text">HEX: --</span>
+    </div>
+</header>
+
+<div class="container">
+    <div class="pane" id="picker-pane">
+        <canvas id="source-canvas"></canvas>
+        <div id="upload-hint" style="position:absolute; color:#666;">Click “Change Image” button to start</div>
+    </div>
+
+    <div class="pane">
+        <div id="guide-wrapper">
+            <img id="guide-img" src="./sf.png" alt="screenshot sample" onerror="this.src='https://via.placeholder.com/1280x720?text=Please+Upload+ss.jpg+to+the+Folder'">
+            <canvas id="guide-overlay"></canvas>
+        </div>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('source-canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const guideOverlay = document.getElementById('guide-overlay');
+    const gctx = guideOverlay.getContext('2d');
+    const guideImg = document.getElementById('guide-img');
+
+    let img = new Image();
+    let scale = 1;
+    let originX = 0;
+    let originY = 0;
+    let isDragging = false;
+    let lastMousePos = { x: 0, y: 0 };
+    let lastTouchDist = 0;
+
+    // 调色盘硬编码坐标 (基于 1280x720 截图比例)
+    const GUIDE_W = 1280;
+    const GUIDE_H = 720;
+    const RECT_SXV = { x1: 456, y1: 252, x2: 1028, y2: 554 }; // S*V 矩形区
+    const SLIDER_HUE = { x1: 502, y1: 597, x2: 982, y2: 621 }; // Hue 滑块区
+
+    // --- 核心算法：非线性映射 ---
+    // y = 0.49*x + 0.2*x^38 + 0.31*x^3.9
+    function curveF(x) {
+        return 0.49 * x + 0.2 * Math.pow(x, 38) + 0.31 * Math.pow(x, 3.9);
+    }
+
+    // 使用二分法求解反函数，由颜色值反推坐标位置
+    function solveX(targetY) {
+        if (targetY <= 0) return 0;
+        if (targetY >= 1) return 1;
+        let low = 0, high = 1;
+        for (let i = 0; i < 20; i++) { // 20次迭代精度足够
+            let mid = (low + high) / 2;
+            if (curveF(mid) < targetY) low = mid;
+            else high = mid;
+        }
+        return (low + high) / 2;
+    }
+
+    // --- 颜色处理 ---
+    function rgbToHsv(r, g, b) {
+        r /= 255; g /= 255; b /= 255;
+        let max = Math.max(r, g, b), min = Math.min(r, g, b);
+        let h, s, v = max;
+        let d = max - min;
+        s = max === 0 ? 0 : d / max;
+        if (max === min) {
+            h = 0;
+        } else {
+            switch (max) {
+                case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                case g: h = (b - r) / d + 2; break;
+                case b: h = (r - g) / d + 4; break;
+            }
+            h /= 6;
+        }
+        return [h, s, v];
+    }
+
+    function hsvToRgb(h, s, v) {
+        let r, g, b;
+        const i = Math.floor(h * 6);
+        const f = h * 6 - i;
+        const p = v * (1 - s);
+        const q = v * (1 - f * s);
+        const t = v * (1 - (1 - f) * s);
+        switch (i % 6) {
+            case 0: r = v, g = t, b = p; break;
+            case 1: r = q, g = v, b = p; break;
+            case 2: r = p, g = v, b = t; break;
+            case 3: r = p, g = q, b = v; break;
+            case 4: r = t, g = p, b = v; break;
+            case 5: r = v, g = p, b = q; break;
+        }
+        return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+    }
+
+    // --- 绘图与交互 ---
+    function handleFile(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            img.onload = () => {
+                document.getElementById('upload-hint').style.display = 'none';
+                resetView();
+            };
+            img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function resetView() {
+        if (!img.src) return;
+        const pane = document.getElementById('picker-pane');
+        const ratio = Math.min(pane.clientWidth / img.width, pane.clientHeight / img.height);
+        scale = ratio;
+        originX = (pane.clientWidth - img.width * scale) / 2;
+        originY = (pane.clientHeight - img.height * scale) / 2;
+        drawSource();
+    }
+
+    function drawSource() {
+        if (!img.src) return;
+        canvas.width = document.getElementById('picker-pane').clientWidth;
+        canvas.height = document.getElementById('picker-pane').clientHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.imageSmoothingEnabled = false; // 关键：禁用平滑处理
+        ctx.drawImage(img, originX, originY, img.width * scale, img.height * scale);
+    }
+
+    function pickColor(x, y) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = x - rect.left;
+        const mouseY = y - rect.top;
+        
+        const pixel = ctx.getImageData(mouseX, mouseY, 1, 1).data;
+        if (pixel[3] === 0) return; // 透明区域
+
+        const [h, s, v] = rgbToHsv(pixel[0], pixel[1], pixel[2]);
+        updateGuide(h, s, v, pixel);
+        
+        // 更新 UI
+        const hex = "#" + ((1 << 24) + (pixel[0] << 16) + (pixel[1] << 8) + pixel[2]).toString(16).slice(1).toUpperCase();
+        document.getElementById('rgb-text').innerText = `HEX: ${hex}`;
+        document.getElementById('current-color-bg').style.background = hex;
+    }
+
+    function drawDebugRegions() {
+        const sw = guideOverlay.width / GUIDE_W;
+        const sh = guideOverlay.height / GUIDE_H;
+
+        gctx.strokeStyle = "rgba(0, 255, 0, 0.5)"; // 绿色半透明表示识别区
+        gctx.lineWidth = 2;
+
+        // 绘制 SxV 矩形区域
+        gctx.strokeRect(
+            RECT_SXV.x1 * sw, 
+            RECT_SXV.y1 * sh, 
+            (RECT_SXV.x2 - RECT_SXV.x1) * sw, 
+            (RECT_SXV.y2 - RECT_SXV.y1) * sh
+        );
+
+        // 绘制 Hue 滑块区域
+        gctx.strokeStyle = "rgba(255, 0, 0, 0.5)"; // 红色半透明
+        gctx.strokeRect(
+            SLIDER_HUE.x1 * sw, 
+            SLIDER_HUE.y1 * sh, 
+            (SLIDER_HUE.x2 - SLIDER_HUE.x1) * sw, 
+            (SLIDER_HUE.y2 - SLIDER_HUE.y1) * sh
+        );
+    }
+
+    function drawColorSpace(h, sw, sh) {
+        // 1. 绘制动态 SxV 颜色空间背景
+        const rectW = Math.round((RECT_SXV.x2 - RECT_SXV.x1) * sw);
+        const rectH = Math.round((RECT_SXV.y2 - RECT_SXV.y1) * sh);
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = rectW;
+        offCanvas.height = rectH;
+        const octx = offCanvas.getContext('2d');
+        const imgData = octx.createImageData(rectW, rectH);
+
+        for (let iy = 0; iy < rectH; iy++) {
+            for (let ix = 0; ix < rectW; ix++) {
+                // 将当前像素坐标转为 0-1 的线性比例 x
+                const xPercent = ix / rectW;
+                const yPercent = iy / rectH;
+
+                // 应用非线性曲线 y = 0.49*x + 0.2*x^38 + 0.31*x^3.9 映射到实际 S 和 V
+                const s = curveF(xPercent);
+                const v = 1 - curveF(yPercent); // V从上往下是 1->0
+
+                // 将当前选中的 Hue 与计算出的 S, V 转回 RGB (复用下面的 HSV2RGB 逻辑)
+                const [r, g, b] = hsvToRgb(h, s, v);
+                
+                const index = (iy * rectW + ix) * 4;
+                imgData.data[index] = r;
+                imgData.data[index + 1] = g;
+                imgData.data[index + 2] = b;
+                imgData.data[index + 3] = 255;
+            }
+        }
+        octx.putImageData(imgData, 0, 0);
+        // 将生成的颜色空间覆盖到截图对应位置
+        gctx.drawImage(offCanvas, RECT_SXV.x1 * sw, RECT_SXV.y1 * sh);
+    }
+
+    function updateGuide(h, s, v, rgb) {
+        guideOverlay.width = guideImg.clientWidth;
+        guideOverlay.height = guideImg.clientHeight;
+        const sw = guideOverlay.width / GUIDE_W;
+        const sh = guideOverlay.height / GUIDE_H;
+
+        gctx.clearRect(0, 0, guideOverlay.width, guideOverlay.height);
+
+        drawColorSpace(h, sw, sh);
+        // drawDebugRegions();
+
+        // 计算坐标
+        // Hue: 线性分布
+        const hueX = SLIDER_HUE.x1 + (1-h) * (SLIDER_HUE.x2 - SLIDER_HUE.x1);
+        const hueY = (SLIDER_HUE.y1 + SLIDER_HUE.y2) / 2;
+
+        // SxV: 非线性
+        // S值从左往右 (0->1)
+        const sx = RECT_SXV.x1 + solveX(s) * (RECT_SXV.x2 - RECT_SXV.x1);
+        // V值从上往下是 亮->暗，即 V=1对应 y=0, V=0对应 y=1
+        const sy = RECT_SXV.y1 + solveX(1 - v) * (RECT_SXV.y2 - RECT_SXV.y1);
+
+        // 绘制标记
+        const drawMarker = (px, py, drawCrossMarker) => {
+            const rx = px * sw;
+            const ry = py * sh;
+            
+            // 十字线
+            if (drawCrossMarker) {
+                gctx.strokeStyle = "rgba(0,0,0,0.8)";
+                gctx.lineWidth = 1;
+                gctx.beginPath();
+                gctx.moveTo(rx, 0); gctx.lineTo(rx, guideOverlay.height);
+                gctx.moveTo(0, ry); gctx.lineTo(guideOverlay.width, ry);
+                gctx.stroke();
+            }
+
+            // 小圆圈
+            gctx.strokeStyle = (rgb[0]+rgb[1]+rgb[2] > 400) ? "black" : "white"; // 根据底色反转圆圈颜色
+            gctx.lineWidth = 3;
+            gctx.beginPath();
+            gctx.arc(rx, ry, 8, 0, Math.PI * 2);
+            gctx.stroke();
+        };
+
+        const drawSecondCircle = (px, py) => {
+            const hvPad = 36
+            if (px < RECT_SXV.x1 + hvPad) {
+                px = RECT_SXV.x1 + hvPad
+            }
+            if (px > RECT_SXV.x2 - hvPad) {
+                px = RECT_SXV.x2 - hvPad
+            }
+            if (py < RECT_SXV.y1 + hvPad) {
+                py = RECT_SXV.y1 + hvPad
+            }
+            if (py > RECT_SXV.y2 - hvPad) {
+                py = RECT_SXV.y2 - hvPad
+            }
+            const rx = px * sw;
+            const ry = py * sh;
+
+            // gctx.strokeStyle = (rgb[0]+rgb[1]+rgb[2] > 400) ? "black" : "white";
+            gctx.strokeStyle = "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ",1)";
+            gctx.lineWidth = 8;
+            gctx.beginPath();
+            gctx.arc(rx, ry, 49, 0, Math.PI * 2);
+            gctx.stroke();
+        }
+
+        drawMarker(hueX, hueY, false);
+        drawMarker(sx, sy, true);
+        drawSecondCircle(sx, sy);
+    }
+
+    // --- 事件监听 ---
+    // 鼠标滚轮缩放
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? 0.9 : 1.1;
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        // 以鼠标为中心缩放
+        originX = mouseX - (mouseX - originX) * delta;
+        originY = mouseY - (mouseY - originY) * delta;
+        scale *= delta;
+        drawSource();
+    }, { passive: false });
+
+    // 鼠标拖拽与点击
+    canvas.addEventListener('mousedown', e => {
+        isDragging = true;
+        lastMousePos = { x: e.clientX, y: e.clientY };
+        startPos = { x: e.clientX, y: e.clientY }; // 记录起点
+    });
+
+    window.addEventListener('mousemove', e => {
+        if (!isDragging) return;
+        originX += e.clientX - lastMousePos.x;
+        originY += e.clientY - lastMousePos.y;
+        lastMousePos = { x: e.clientX, y: e.clientY };
+        drawSource();
+    });
+
+    window.addEventListener('mouseup', e => {
+        if (isDragging && Math.abs(e.clientX - lastMousePos.x) < 2 && Math.abs(e.clientY - lastMousePos.y) < 2) {
+            const moveDist = Math.hypot(e.clientX - startPos.x, e.clientY - startPos.y);
+            // 如果位移小于 5 像素，则判定为“点击取色”
+            if (moveDist < 5) {
+                pickColor(e.clientX, e.clientY);
+            }
+        }
+        isDragging = false;
+    });
+
+    // 手机端触摸支持
+    canvas.addEventListener('touchstart', e => {
+        if (e.touches.length === 1) {
+            lastMousePos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        } else if (e.touches.length === 2) {
+            lastTouchDist = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+        }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if (e.touches.length === 1) {
+            originX += e.touches[0].clientX - lastMousePos.x;
+            originY += e.touches[0].clientY - lastMousePos.y;
+            lastMousePos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        } else if (e.touches.length === 2) {
+            const dist = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+            const delta = dist / lastTouchDist;
+            const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            originX = midX - (midX - originX) * delta;
+            originY = midY - (midY - originY) * delta;
+            scale *= delta;
+            lastTouchDist = dist;
+        }
+        drawSource();
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', e => {
+        if (e.changedTouches.length === 1) {
+            pickColor(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+        }
+    });
+
+    // 监听窗口大小变化
+    window.addEventListener('resize', () => {
+        drawSource();
+        // 重新渲染参考线
+        guideOverlay.width = guideImg.clientWidth;
+        guideOverlay.height = guideImg.clientHeight;
+    });
+
+</script>
+</body>
+</html>
